@@ -10,7 +10,7 @@ const {
 } = require('../controllers/adminController');
 const { getAllOrders, updateOrderStatus } = require('../controllers/orderController');
 const { getAllCoupons, createCoupon, updateCoupon, deleteCoupon } = require('../controllers/couponController');
-const { createProduct, updateProduct, deleteProduct, addVariant } = require('../controllers/productController');
+const { createProduct, updateProduct, deleteProduct, addVariant, updateProductOffer } = require('../controllers/productController');
 const { initiateRefund } = require('../controllers/paymentController');
 const { adminProtect } = require('../middleware/adminAuth');
 const { uploadProduct, uploadHero } = require('../config/cloudinary');
@@ -34,6 +34,7 @@ router.post('/products', uploadProduct.array('images', 10), createProduct);
 router.put('/products/:id', uploadProduct.array('images', 10), updateProduct);
 router.delete('/products/:id', deleteProduct);
 router.post('/products/:id/variants', addVariant);
+router.patch('/products/:id/offer', updateProductOffer);
 
 // Orders
 router.get('/orders', getAllOrders);

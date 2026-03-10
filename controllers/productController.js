@@ -71,12 +71,23 @@ const getProduct = async (req, res) => {
 // POST /api/admin/products (admin)
 const createProduct = async (req, res) => {
     try {
-        const { name, price, salePrice, category, description, stock, tags } = req.body;
+        const { name, price, salePrice, category, description, stock, tags, mrp, discountPercent, isOfferActive, offerLabel } = req.body;
         const images = req.files ? req.files.map(f => f.path) : [];
+
+        // Auto-calculate selling price if MRP and discount provided
+        let computedSellingPrice = undefined;
+        if (mrp && discountPercent !== undefined) {
+            computedSellingPrice = Math.round(parseFloat(mrp) - (parseFloat(mrp) * parseInt(discountPercent) / 100));
+        }
 
         const product = await Product.create({
             name, price, salePrice: salePrice || undefined, category, description, stock: stock || 0,
             images, tags: tags ? (Array.isArray(tags) ? tags : [tags]) : [],
+            mrp: mrp || undefined,
+            sellingPrice: computedSellingPrice,
+            discountPercent: discountPercent || 0,
+            isOfferActive: isOfferActive === 'true' || isOfferActive === true,
+            offerLabel: offerLabel || undefined,
         });
         res.status(201).json({ product });
     } catch (error) {
@@ -88,7 +99,7 @@ const createProduct = async (req, res) => {
 // PUT /api/admin/products/:id (admin)
 const updateProduct = async (req, res) => {
     try {
-        const { name, price, salePrice, category, description, stock, tags, isActive, existingImages } = req.body;
+        const { name, price, salePrice, category, description, stock, tags, isActive, existingImages, mrp, discountPercent, isOfferActive, offerLabel } = req.body;
         const product = await Product.findById(req.params.id);
         if (!product) return res.status(404).json({ message: 'Product not found' });
 
@@ -104,6 +115,43 @@ const updateProduct = async (req, res) => {
         product.tags = tags ? (Array.isArray(tags) ? tags : [tags]) : product.tags;
         product.isActive = isActive !== undefined ? (isActive === 'true' || isActive === true) : product.isActive;
         product.images = [...oldImages, ...newImages];
+
+        // Offer fields
+        if (mrp !== undefined) product.mrp = parseFloat(mrp) || product.mrp;
+        if (discountPercent !== undefined) product.discountPercent = parseInt(discountPercent) || 0;
+        if (isOfferActive !== undefined) product.isOfferActive = isOfferActive === 'true' || isOfferActive === true;
+        if (offerLabel !== undefined) product.offerLabel = offerLabel || undefined;
+        // Auto-calculate sellingPrice
+        if (product.mrp && product.discountPercent !== undefined) {
+            product.sellingPrice = Math.round(product.mrp - (product.mrp * product.discountPercent / 100));
+        }
+
+        await product.save();
+        res.json({ product });
+    } catch (error) {
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};
+
+// PATCH /api/admin/products/:id/offer (admin)
+const updateProductOffer = async (req, res) => {
+    try {
+        const { mrp, discountPercent, isOfferActive, offerLabel } = req.body;
+        const product = await Product.findById(req.params.id);
+        if (!product) return res.status(404).json({ message: 'Product not found' });
+
+        if (mrp === undefined || mrp === null) return res.status(400).json({ message: 'MRP is required' });
+        if (discountPercent < 0 || discountPercent > 90) return res.status(400).json({ message: 'Discount must be 0-90%' });
+
+        const parsedMrp = parseFloat(mrp);
+        const parsedDiscount = parseInt(discountPercent) || 0;
+        const computedSellingPrice = Math.round(parsedMrp - (parsedMrp * parsedDiscount / 100));
+
+        product.mrp = parsedMrp;
+        product.discountPercent = parsedDiscount;
+        product.sellingPrice = computedSellingPrice;
+        product.isOfferActive = isOfferActive === true || isOfferActive === 'true';
+        product.offerLabel = offerLabel || undefined;
 
         await product.save();
         res.json({ product });
@@ -147,4 +195,4 @@ const addVariant = async (req, res) => {
     }
 };
 
-module.exports = { getProducts, getBestSellers, getCategories, getProduct, createProduct, updateProduct, deleteProduct, addVariant };
+module.exports = { getProducts, getBestSellers, getCategories, getProduct, createProduct, updateProduct, deleteProduct, addVariant, updateProductOffer };

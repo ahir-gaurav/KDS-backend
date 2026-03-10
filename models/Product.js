@@ -19,6 +19,12 @@ const productSchema = new mongoose.Schema(
         soldCount: { type: Number, default: 0 },
         tags: [{ type: String, enum: ['Best Seller', 'New Drop', 'Limited Edition'] }],
         isActive: { type: Boolean, default: true },
+        // Offer & Pricing fields
+        mrp: { type: Number },
+        sellingPrice: { type: Number },
+        discountPercent: { type: Number, default: 0, min: 0, max: 90 },
+        isOfferActive: { type: Boolean, default: false },
+        offerLabel: { type: String, trim: true },
     },
     { timestamps: true }
 );
