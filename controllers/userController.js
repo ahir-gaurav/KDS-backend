@@ -13,13 +13,27 @@ const getProfile = async (req, res) => {
 const updateProfile = async (req, res) => {
     try {
         const { name, phone } = req.body;
+        console.log('Update profile request body:', req.body);
+        console.log(`Update profile attempt for user ID: ${req.user._id}`);
+        
         const user = await User.findById(req.user._id);
-        if (name) user.name = name;
-        if (phone) user.phone = phone;
+        if (!user) {
+            console.log('User not found in updateProfile for ID:', req.user._id);
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        console.log('Current user in DB:', { name: user.name, phone: user.phone, email: user.email });
+
+        if (name !== undefined) user.name = name;
+        if (phone !== undefined) user.phone = phone;
+        
+        console.log('Saving user profile...');
         await user.save();
+        console.log('Profile updated successfully');
         res.json({ user });
     } catch (error) {
-        res.status(500).json({ message: 'Server error' });
+        console.error('Update profile full error:', error);
+        res.status(500).json({ message: 'Server error', error: error.message, stack: error.stack });
     }
 };
 

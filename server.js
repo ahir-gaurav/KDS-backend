@@ -32,21 +32,42 @@ connectDB();
 // Trust proxy (for rate limiting behind Render/Railway)
 app.set('trust proxy', 1);
 
-// CORS
+// CORS — must be first middleware, before routes and body parsers
 const allowedOrigins = [
-    process.env.FRONTEND_URL || 'http://localhost:3000',
-    process.env.ADMIN_URL || 'http://localhost:3001',
-];
-app.use(cors({
-    origin: (origin, callback) => {
-        if (!origin || allowedOrigins.includes(origin)) {
+    // Always allow local development (these are hardcoded, not fallbacks)
+    'http://localhost:3000',
+    'http://localhost:3001',
+    // Production URLs from environment (set these in Render dashboard)
+    process.env.FRONTEND_URL,   // e.g. https://your-store.vercel.app
+    process.env.ADMIN_URL,      // e.g. https://your-admin.vercel.app
+    process.env.FRONTEND_URL_2, // optional: custom domain
+].filter(Boolean); // removes undefined/empty entries
+
+console.log('✅ CORS Allowed Origins:', allowedOrigins);
+
+const corsOptions = {
+    origin: function (origin, callback) {
+        // Allow requests with no origin (Postman, curl, server-to-server)
+        if (!origin) return callback(null, true);
+
+        if (allowedOrigins.includes(origin)) {
             callback(null, true);
         } else {
+            console.error('🚫 Blocked by CORS — origin:', origin);
             callback(new Error('Not allowed by CORS'));
         }
     },
     credentials: true,
-}));
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
+};
+
+app.use(cors(corsOptions));
+
+// Handle preflight OPTIONS requests for all routes
+// This MUST come before route definitions
+app.options('*', cors(corsOptions));
+
 
 // Security
 app.use(helmet());
@@ -59,6 +80,15 @@ const globalLimiter = rateLimit({
     legacyHeaders: false,
 });
 app.use(globalLimiter);
+
+// Strict rate limiter for admin auth endpoints
+const adminAuthLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { message: 'Too many attempts, please try again later.' },
+});
 
 // Cookie parser
 app.use(cookieParser());
@@ -83,6 +113,8 @@ app.use('/api/orders', orderRoutes);
 app.use('/api/payment', paymentRoutes);
 app.use('/api/coupons', couponRoutes);
 app.use('/api/user', userRoutes);
+app.use('/api/admin/auth/login', adminAuthLimiter);
+app.use('/api/admin/auth/signup', adminAuthLimiter);
 app.use('/api/admin', adminRoutes);
 
 // Global error handler

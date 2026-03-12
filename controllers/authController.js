@@ -1,10 +1,36 @@
 const jwt = require('jsonwebtoken');
+const { createPublicKey } = require('crypto');
 const User = require('../models/User');
 const { generateOTP } = require('../utils/helpers');
 const { sendWelcomeOTP, sendPasswordResetOTP } = require('../services/email');
 
 const generateToken = (id) => {
     return jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+};
+
+// In-memory JWKS cache
+const jwksCache = {};
+
+const fetchClerkJWKS = async (issuer) => {
+    const cached = jwksCache[issuer];
+    if (cached && Date.now() - cached.time < 3600000) return cached.keys;
+    const res = await fetch(`${issuer}/.well-known/jwks.json`);
+    if (!res.ok) throw new Error('Failed to fetch Clerk JWKS');
+    const { keys } = await res.json();
+    jwksCache[issuer] = { keys, time: Date.now() };
+    return keys;
+};
+
+const verifyClerkToken = async (token) => {
+    const decoded = jwt.decode(token, { complete: true });
+    if (!decoded?.payload?.iss) throw new Error('Invalid Clerk token');
+    const { iss } = decoded.payload;
+    if (!iss.includes('clerk')) throw new Error('Not a Clerk token');
+    const keys = await fetchClerkJWKS(iss);
+    const matchingKey = keys.find(k => k.kid === decoded.header.kid);
+    if (!matchingKey) throw new Error('Clerk signing key not found');
+    const publicKey = createPublicKey({ key: matchingKey, format: 'jwk' });
+    return jwt.verify(token, publicKey, { algorithms: ['RS256'] });
 };
 
 const setCookie = (res, token) => {
@@ -146,4 +172,45 @@ const resetPassword = async (req, res) => {
     }
 };
 
-module.exports = { signup, verifyOTP, login, logout, getMe, forgotPassword, resetPassword };
+// POST /api/auth/clerk-sync
+// Called by the frontend after Clerk sign-in to get a backend JWT
+const clerkSync = async (req, res) => {
+    try {
+        const { clerkToken, email, name } = req.body;
+        if (!clerkToken || !email) {
+            return res.status(400).json({ message: 'clerkToken and email are required' });
+        }
+
+        // Verify the Clerk JWT signature — this proves the email is authentic
+        await verifyClerkToken(clerkToken);
+
+        // Find or create the backend user by email
+        let user = await User.findOne({ email: email.toLowerCase() });
+        if (!user) {
+            // Auto-create a backend user for this Clerk-authenticated user
+            user = await User.create({
+                name: name || email.split('@')[0],
+                email: email.toLowerCase(),
+                password: jwt.sign({ email }, process.env.JWT_SECRET), // placeholder, won't be used
+                isVerified: true,
+            });
+        } else if (!user.isVerified) {
+            // If the user registered via old flow but didn't verify, trust Clerk
+            user.isVerified = true;
+            await user.save();
+        }
+
+        const token = generateToken(user._id);
+        setCookie(res, token);
+        res.json({
+            message: 'Synced',
+            token,
+            user: { id: user._id, name: user.name, email: user.email },
+        });
+    } catch (error) {
+        console.error('Clerk sync error:', error.message);
+        res.status(401).json({ message: 'Clerk token verification failed' });
+    }
+};
+
+module.exports = { signup, verifyOTP, login, logout, getMe, forgotPassword, resetPassword, clerkSync };

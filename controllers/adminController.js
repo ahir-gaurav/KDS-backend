@@ -29,13 +29,18 @@ const adminLogin = async (req, res) => {
     try {
         const { email, password } = req.body;
         const admin = await Admin.findOne({ email });
-        if (!admin) return res.status(401).json({ message: 'Invalid credentials' });
+        if (!admin) {
+            return res.status(401).json({ message: 'Invalid credentials' });
+        }
         const isMatch = await admin.comparePassword(password);
-        if (!isMatch) return res.status(401).json({ message: 'Invalid credentials' });
+        if (!isMatch) {
+            return res.status(401).json({ message: 'Invalid credentials' });
+        }
         const token = jwt.sign({ id: admin._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
         res.cookie('adminToken', token, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'none', maxAge: 7 * 24 * 60 * 60 * 1000 });
         res.json({ admin: { id: admin._id, name: admin.name, email: admin.email }, token });
     } catch (error) {
+        console.error('Admin login error:', error);
         res.status(500).json({ message: 'Server error' });
     }
 };

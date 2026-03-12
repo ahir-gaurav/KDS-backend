@@ -1,5 +1,6 @@
 const Product = require('../models/Product');
 const { cloudinary } = require('../config/cloudinary');
+const { computeSellingPrice } = require('../utils/price');
 
 // GET /api/products
 const getProducts = async (req, res) => {
@@ -75,10 +76,9 @@ const createProduct = async (req, res) => {
         const images = req.files ? req.files.map(f => f.path) : [];
 
         // Auto-calculate selling price if MRP and discount provided
-        let computedSellingPrice = undefined;
-        if (mrp && discountPercent !== undefined) {
-            computedSellingPrice = Math.round(parseFloat(mrp) - (parseFloat(mrp) * parseInt(discountPercent) / 100));
-        }
+        const computedSellingPrice = (mrp && discountPercent !== undefined)
+            ? computeSellingPrice(mrp, discountPercent)
+            : undefined;
 
         const product = await Product.create({
             name, price, salePrice: salePrice || undefined, category, description, stock: stock || 0,
@@ -123,7 +123,7 @@ const updateProduct = async (req, res) => {
         if (offerLabel !== undefined) product.offerLabel = offerLabel || undefined;
         // Auto-calculate sellingPrice
         if (product.mrp && product.discountPercent !== undefined) {
-            product.sellingPrice = Math.round(product.mrp - (product.mrp * product.discountPercent / 100));
+            product.sellingPrice = computeSellingPrice(product.mrp, product.discountPercent);
         }
 
         await product.save();
@@ -145,7 +145,7 @@ const updateProductOffer = async (req, res) => {
 
         const parsedMrp = parseFloat(mrp);
         const parsedDiscount = parseInt(discountPercent) || 0;
-        const computedSellingPrice = Math.round(parsedMrp - (parsedMrp * parsedDiscount / 100));
+        const computedSellingPrice = computeSellingPrice(parsedMrp, parsedDiscount);
 
         product.mrp = parsedMrp;
         product.discountPercent = parsedDiscount;
