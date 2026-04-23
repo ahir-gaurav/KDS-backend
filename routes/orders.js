@@ -1,11 +1,30 @@
-const express = require('express');
-const router = express.Router();
-const { createOrder, getMyOrders, getOrder } = require('../controllers/orderController');
-const { protect } = require('../middleware/auth');
+// backend/routes/orders.js
+'use strict';
 
-router.use(protect);
-router.post('/', createOrder);
-router.get('/my', getMyOrders);
-router.get('/:id', getOrder);
+const express = require('express');
+const router  = express.Router();
+
+const { protect }    = require('../middleware/auth');
+const { adminOnly }  = require('../middleware/roleMiddleware');
+const {
+    placeOrder,
+    getMyOrders,
+    getOrder,
+    cancelOrder,
+    getAllOrders,
+    updateOrderStatus,
+    adminCancelOrder,
+} = require('../controllers/orderController');
+
+// User — protected
+router.post('/',                protect, placeOrder);
+router.get('/my',               protect, getMyOrders);
+router.get('/:id',              protect, getOrder);
+router.post('/:id/cancel',      protect, cancelOrder);
+
+// Admin — protected + adminOnly
+router.get('/',                 protect, adminOnly, getAllOrders);
+router.put('/:id/status',       protect, adminOnly, updateOrderStatus);
+router.delete('/:id',           protect, adminOnly, adminCancelOrder);
 
 module.exports = router;

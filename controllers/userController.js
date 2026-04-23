@@ -1,84 +1,62 @@
-const User = require('../models/User');
+// backend/controllers/userController.js
+'use strict';
 
-// GET /api/user/profile
-const getProfile = async (req, res) => {
-    try {
-        res.json({ user: req.user });
-    } catch (error) {
-        res.status(500).json({ message: 'Server error' });
+const asyncCatch = require('../utils/asyncCatch');
+const AppError   = require('../utils/AppError');
+const User       = require('../models/User');
+const { pick }   = require('../utils/helpers');
+
+// ── GET /api/user/profile ─────────────────────────────────────────────────────
+const getProfile = asyncCatch(async (req, res) => {
+    // req.user is already attached by protect middleware
+    res.status(200).json({ success: true, user: req.user.toSafeObject() });
+});
+
+// ── PATCH /api/user/profile ──────────────────────────────────────────────────
+const updateProfile = asyncCatch(async (req, res) => {
+    const updates = pick(req.body, ['name', 'phone', 'avatar']);
+    
+    const user = await User.findByIdAndUpdate(req.user._id, updates, {
+        new: true,
+        runValidators: true,
+    });
+
+    res.status(200).json({ 
+        success: true, 
+        message: 'Profile updated successfully.', 
+        user: user.toSafeObject() 
+    });
+});
+
+// ── POST /api/user/addresses ──────────────────────────────────────────────────
+const addAddress = asyncCatch(async (req, res) => {
+    const address = req.body;
+    if (address.isDefault) {
+        req.user.addresses.forEach(a => a.isDefault = false);
     }
-};
+    
+    req.user.addresses.push(address);
+    await req.user.save();
+    
+    res.status(201).json({ 
+        success: true, 
+        message: 'Address added.', 
+        addresses: req.user.addresses 
+    });
+});
 
-// PUT /api/user/profile
-const updateProfile = async (req, res) => {
-    try {
-        const { name, phone } = req.body;
-        console.log('Update profile request body:', req.body);
-        console.log(`Update profile attempt for user ID: ${req.user._id}`);
-        
-        const user = await User.findById(req.user._id);
-        if (!user) {
-            console.log('User not found in updateProfile for ID:', req.user._id);
-            return res.status(404).json({ message: 'User not found' });
-        }
+// ── DELETE /api/user/addresses/:addressId ────────────────────────────────────
+const removeAddress = asyncCatch(async (req, res) => {
+    req.user.addresses = req.user.addresses.filter(
+        a => a._id.toString() !== req.params.addressId
+    );
+    await req.user.save();
+    
+    res.status(200).json({ 
+        success: true, 
+        message: 'Address removed.', 
+        addresses: req.user.addresses 
+    });
+});
 
-        console.log('Current user in DB:', { name: user.name, phone: user.phone, email: user.email });
-
-        if (name !== undefined) user.name = name;
-        if (phone !== undefined) user.phone = phone;
-        
-        console.log('Saving user profile...');
-        await user.save();
-        console.log('Profile updated successfully');
-        res.json({ user });
-    } catch (error) {
-        console.error('Update profile full error:', error);
-        res.status(500).json({ message: 'Server error', error: error.message, stack: error.stack });
-    }
-};
-
-// POST /api/user/addresses
-const addAddress = async (req, res) => {
-    try {
-        const user = await User.findById(req.user._id);
-        if (req.body.isDefault) {
-            user.addresses.forEach(a => (a.isDefault = false));
-        }
-        user.addresses.push(req.body);
-        await user.save();
-        res.json({ addresses: user.addresses });
-    } catch (error) {
-        res.status(500).json({ message: 'Server error' });
-    }
-};
-
-// PUT /api/user/addresses/:addressId
-const updateAddress = async (req, res) => {
-    try {
-        const user = await User.findById(req.user._id);
-        const address = user.addresses.id(req.params.addressId);
-        if (!address) return res.status(404).json({ message: 'Address not found' });
-        if (req.body.isDefault) {
-            user.addresses.forEach(a => (a.isDefault = false));
-        }
-        Object.assign(address, req.body);
-        await user.save();
-        res.json({ addresses: user.addresses });
-    } catch (error) {
-        res.status(500).json({ message: 'Server error' });
-    }
-};
-
-// DELETE /api/user/addresses/:addressId
-const deleteAddress = async (req, res) => {
-    try {
-        const user = await User.findById(req.user._id);
-        user.addresses = user.addresses.filter(a => a._id.toString() !== req.params.addressId);
-        await user.save();
-        res.json({ addresses: user.addresses });
-    } catch (error) {
-        res.status(500).json({ message: 'Server error' });
-    }
-};
-
-module.exports = { getProfile, updateProfile, addAddress, updateAddress, deleteAddress };
+module.exports = { getProfile, updateProfile, addAddress, removeAddress };

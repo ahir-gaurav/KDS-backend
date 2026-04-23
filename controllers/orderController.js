@@ -1,190 +1,99 @@
-const Order = require('../models/Order');
-const Product = require('../models/Product');
-const Settings = require('../models/Settings');
-const Coupon = require('../models/Coupon');
-const razorpay = require('../config/razorpay');
-const {
-    sendOrderConfirmation,
-    sendOrderShipped,
-    sendOrderDelivered,
-    sendOrderCancelled,
-    sendPaymentFailed,
-} = require('../services/email');
+// backend/controllers/orderController.js
+'use strict';
 
-// POST /api/orders
-const createOrder = async (req, res) => {
-    try {
-        const { products, deliveryAddress, paymentMethod, couponCode } = req.body;
-        const settings = (await Settings.findOne()) || {};
-        const gstRate = settings.gst || 18;
-        const deliveryFee = settings.deliveryCharge || 80;
-        const freeDeliveryThreshold = settings.freeDeliveryThreshold || 2000;
+const asyncCatch   = require('../utils/asyncCatch');
+const AppError     = require('../utils/AppError');
+const orderService = require('../services/orderService');
+const emailService = require('../services/emailService');
 
-        // Validate and calculate subtotal
-        let subtotal = 0;
-        const orderProducts = [];
-        for (const item of products) {
-            const product = await Product.findById(item.productId);
-            if (!product) return res.status(404).json({ message: `Product not found: ${item.productId}` });
-            const price = product.salePrice || product.price;
-            orderProducts.push({
-                product: product._id,
-                name: product.name,
-                image: product.images[0] || '',
-                size: item.size,
-                quantity: item.quantity,
-                price,
-            });
-            subtotal += price * item.quantity;
-        }
+// ── POST /api/orders ──────────────────────────────────────────────────────────
+const placeOrder = asyncCatch(async (req, res) => {
+    const { items, shippingAddress, paymentMethod, couponCode, deliveryCharge, couponDiscount } = req.body;
 
-        let couponDiscount = 0;
-        let appliedCoupon = null;
-        if (couponCode) {
-            const coupon = await Coupon.findOne({ code: couponCode.toUpperCase(), isActive: true });
-            if (coupon && coupon.expiryDate >= new Date() && subtotal >= coupon.minOrderValue) {
-                if (coupon.type === 'firstOrder') {
-                    const prevOrders = await Order.countDocuments({ user: req.user._id });
-                    if (prevOrders === 0) {
-                        couponDiscount = Math.round((subtotal * coupon.discount) / 100);
-                        appliedCoupon = coupon;
-                    }
-                } else {
-                    couponDiscount = Math.round((subtotal * coupon.discount) / 100);
-                    appliedCoupon = coupon;
-                }
-            }
-        }
+    if (!items?.length)       throw new AppError('Order must contain at least one item.', 400);
+    if (!shippingAddress)     throw new AppError('Shipping address is required.', 400);
+    if (!paymentMethod)       throw new AppError('Payment method is required.', 400);
 
-        const discountedSubtotal = subtotal - couponDiscount;
-        const delivery = discountedSubtotal >= freeDeliveryThreshold ? 0 : deliveryFee;
-        const gstAmount = Math.round((discountedSubtotal * gstRate) / 100);
-        const totalPrice = discountedSubtotal + gstAmount + delivery;
+    const order = await orderService.createOrder({
+        user:            req.user,
+        items,
+        shippingAddress,
+        paymentMethod,
+        couponCode,
+        deliveryCharge:  deliveryCharge  || 0,
+        couponDiscount:  couponDiscount  || 0,
+    });
 
-        const order = new Order({
-            user: req.user._id,
-            products: orderProducts,
-            subtotal,
-            gst: gstRate,
-            gstAmount,
-            deliveryCharge: delivery,
-            couponCode: couponCode || undefined,
-            couponDiscount,
-            totalPrice,
-            deliveryAddress,
-            paymentMethod,
-            paymentStatus: paymentMethod === 'cod' ? 'pending' : 'pending',
-            status: 'Processing',
-            statusHistory: [{ status: 'Processing', timestamp: new Date() }],
-        });
+    // Send confirmation email (non-blocking)
+    emailService.sendOrderConfirmation(req.user, order).catch(console.error);
 
-        if (paymentMethod === 'razorpay') {
-            const rzpOrder = await razorpay.orders.create({
-                amount: totalPrice * 100,
-                currency: 'INR',
-                receipt: `order_${Date.now()}`,
-            });
-            order.razorpayOrderId = rzpOrder.id;
-        }
+    res.status(201).json({ success: true, message: 'Order placed successfully.', order });
+});
 
-        await order.save();
+// ── GET /api/orders/my ────────────────────────────────────────────────────────
+const getMyOrders = asyncCatch(async (req, res) => {
+    const result = await orderService.getUserOrders(req.user._id, req.query);
+    res.status(200).json({ success: true, ...result });
+});
 
-        // Update user orders array
-        await req.user.updateOne({ $push: { orders: order._id } });
+// ── GET /api/orders/:id ───────────────────────────────────────────────────────
+const getOrder = asyncCatch(async (req, res) => {
+    const { Order } = require('../models/Order');
+    const order = await require('../models/Order')
+        .findOne({ _id: req.params.id, user: req.user._id })
+        .populate('items.product', 'title images');
 
-        // Update sold counts
-        for (const item of orderProducts) {
-            await Product.findByIdAndUpdate(item.product, { $inc: { soldCount: item.quantity } });
-        }
+    if (!order) throw new AppError('Order not found.', 404);
+    res.status(200).json({ success: true, order });
+});
 
-        // Update coupon usage
-        if (appliedCoupon) {
-            appliedCoupon.usedCount += 1;
-            appliedCoupon.usedBy.push(req.user._id);
-            await appliedCoupon.save();
-        }
+// ── POST /api/orders/:id/cancel ───────────────────────────────────────────────
+const cancelOrder = asyncCatch(async (req, res) => {
+    const order = await orderService.cancelOrder(req.params.id, {
+        userId:       req.user._id,
+        cancelReason: req.body.cancelReason,
+    });
 
-        // Send confirmation for COD
-        if (paymentMethod === 'cod') {
-            await sendOrderConfirmation(req.user, order);
-        }
+    emailService.sendOrderCancelled(req.user, order).catch(console.error);
+    res.status(200).json({ success: true, message: 'Order cancelled.', order });
+});
 
-        res.status(201).json({
-            order,
-            razorpayOrderId: order.razorpayOrderId,
-            totalPrice,
-        });
-    } catch (error) {
-        console.error('Create order error:', error);
-        res.status(500).json({ message: 'Server error', error: error.message });
+// ── GET /api/orders (admin) ───────────────────────────────────────────────────
+const getAllOrders = asyncCatch(async (req, res) => {
+    const result = await orderService.getAllOrders(req.query);
+    res.status(200).json({ success: true, ...result });
+});
+
+// ── PUT /api/orders/:id/status (admin) ────────────────────────────────────────
+const updateOrderStatus = asyncCatch(async (req, res) => {
+    const { status, note } = req.body;
+    if (!status) throw new AppError('Status is required.', 400);
+
+    const order = await orderService.updateOrderStatus(req.params.id, {
+        status,
+        note,
+        updatedBy: req.user._id,
+    });
+
+    const { ORDER_STATUS } = require('../config/constants');
+    const User = require('../models/User');
+    const customer = await User.findById(order.user);
+
+    if (customer) {
+        if (status === ORDER_STATUS.SHIPPED)   emailService.sendOrderShipped(customer, order).catch(console.error);
+        if (status === ORDER_STATUS.DELIVERED) emailService.sendOrderDelivered(customer, order).catch(console.error);
     }
-};
 
-// GET /api/orders/my
-const getMyOrders = async (req, res) => {
-    try {
-        const orders = await Order.find({ user: req.user._id }).sort({ createdAt: -1 });
-        res.json({ orders });
-    } catch (error) {
-        res.status(500).json({ message: 'Server error' });
-    }
-};
+    res.status(200).json({ success: true, message: `Order status updated to "${status}".`, order });
+});
 
-// GET /api/orders/:id
-const getOrder = async (req, res) => {
-    try {
-        const order = await Order.findById(req.params.id);
-        if (!order) return res.status(404).json({ message: 'Order not found' });
-        if (order.user.toString() !== req.user._id.toString()) {
-            return res.status(403).json({ message: 'Not authorized' });
-        }
-        res.json({ order });
-    } catch (error) {
-        res.status(500).json({ message: 'Server error' });
-    }
-};
+// ── DELETE /api/orders/:id (admin) ────────────────────────────────────────────
+const adminCancelOrder = asyncCatch(async (req, res) => {
+    const order = await orderService.cancelOrder(req.params.id, {
+        cancelReason: req.body.cancelReason || 'Cancelled by admin',
+        isAdmin:      true,
+    });
+    res.status(200).json({ success: true, message: 'Order cancelled by admin.', order });
+});
 
-// Admin: GET /api/admin/orders
-const getAllOrders = async (req, res) => {
-    try {
-        const { page = 1, limit = 20, status } = req.query;
-        const query = status ? { status } : {};
-        const total = await Order.countDocuments(query);
-        const orders = await Order.find(query)
-            .populate('user', 'name email')
-            .sort({ createdAt: -1 })
-            .skip((parseInt(page) - 1) * parseInt(limit))
-            .limit(parseInt(limit));
-        res.json({ orders, total });
-    } catch (error) {
-        res.status(500).json({ message: 'Server error' });
-    }
-};
-
-// Admin: PUT /api/admin/orders/:id/status
-const updateOrderStatus = async (req, res) => {
-    try {
-        const { status, trackingInfo, cancelReason } = req.body;
-        const order = await Order.findById(req.params.id).populate('user');
-        if (!order) return res.status(404).json({ message: 'Order not found' });
-
-        order.status = status;
-        order.statusHistory.push({ status, timestamp: new Date() });
-        if (trackingInfo) order.trackingInfo = trackingInfo;
-        if (cancelReason) order.cancelReason = cancelReason;
-
-        await order.save();
-
-        // Send email based on new status
-        const user = order.user;
-        if (status === 'Shipped') await sendOrderShipped(user, order);
-        else if (status === 'Delivered') await sendOrderDelivered(user, order);
-        else if (status === 'Cancelled') await sendOrderCancelled(user, order);
-
-        res.json({ order });
-    } catch (error) {
-        res.status(500).json({ message: 'Server error' });
-    }
-};
-
-module.exports = { createOrder, getMyOrders, getOrder, getAllOrders, updateOrderStatus };
+module.exports = { placeOrder, getMyOrders, getOrder, cancelOrder, getAllOrders, updateOrderStatus, adminCancelOrder };

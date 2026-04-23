@@ -1,13 +1,22 @@
-const express = require('express');
-const router = express.Router();
-const { getProfile, updateProfile, addAddress, updateAddress, deleteAddress } = require('../controllers/userController');
-const { protect } = require('../middleware/auth');
+// backend/routes/user.js
+'use strict';
 
-router.use(protect);
+const express = require('express');
+const router  = express.Router();
+
+const { protect } = require('../middleware/auth');
+const {
+    getProfile,
+    updateProfile,
+    addAddress,
+    removeAddress,
+} = require('../controllers/userController');
+
+router.use(protect); // All user routes require authentication
+
 router.get('/profile', getProfile);
-router.put('/profile', updateProfile);
+router.patch('/profile', updateProfile);
 router.post('/addresses', addAddress);
-router.put('/addresses/:addressId', updateAddress);
-router.delete('/addresses/:addressId', deleteAddress);
+router.delete('/addresses/:addressId', removeAddress);
 
 module.exports = router;
