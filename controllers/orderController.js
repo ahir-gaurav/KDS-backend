@@ -38,12 +38,7 @@ const getMyOrders = asyncCatch(async (req, res) => {
 
 // ── GET /api/orders/:id ───────────────────────────────────────────────────────
 const getOrder = asyncCatch(async (req, res) => {
-    const { Order } = require('../models/Order');
-    const order = await require('../models/Order')
-        .findOne({ _id: req.params.id, user: req.user._id })
-        .populate('items.product', 'title images');
-
-    if (!order) throw new AppError('Order not found.', 404);
+    const order = await orderService.getOrderById(req.params.id, req.user._id);
     res.status(200).json({ success: true, order });
 });
 
@@ -76,12 +71,11 @@ const updateOrderStatus = asyncCatch(async (req, res) => {
     });
 
     const { ORDER_STATUS } = require('../config/constants');
-    const User = require('../models/User');
-    const customer = await User.findById(order.user);
-
-    if (customer) {
-        if (status === ORDER_STATUS.SHIPPED)   emailService.sendOrderShipped(customer, order).catch(console.error);
-        if (status === ORDER_STATUS.DELIVERED) emailService.sendOrderDelivered(customer, order).catch(console.error);
+    
+    // The updated order from orderService already includes joined user info: user: { name, email }
+    if (order.user) {
+        if (status === ORDER_STATUS.SHIPPED)   emailService.sendOrderShipped(order.user, order).catch(console.error);
+        if (status === ORDER_STATUS.DELIVERED) emailService.sendOrderDelivered(order.user, order).catch(console.error);
     }
 
     res.status(200).json({ success: true, message: `Order status updated to "${status}".`, order });

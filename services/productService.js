@@ -1,45 +1,9 @@
 // backend/services/productService.js
 'use strict';
 
-const Product  = require('../models/Product');
+const supabase = require('../config/supabase');
 const AppError = require('../utils/AppError');
 const { PAGINATION } = require('../config/constants');
-
-/**
- * Build a MongoDB filter query from request query params.
- */
-const buildFilter = (query) => {
-    const filter = { isActive: true };
-
-    if (query.category) filter.category = query.category;
-    if (query.brand)    filter.brand = new RegExp(query.brand, 'i');
-    if (query.tag)      filter.tags = query.tag;
-    if (query.featured === 'true') filter.isFeatured = true;
-
-    // Price range
-    if (query.minPrice || query.maxPrice) {
-        filter.price = {};
-        if (query.minPrice) filter.price.$gte = Number(query.minPrice);
-        if (query.maxPrice) filter.price.$lte = Number(query.maxPrice);
-    }
-
-    return filter;
-};
-
-/**
- * Build sort object from query param.
- * Supported: price_asc, price_desc, newest, popular, rating
- */
-const buildSort = (sortParam) => {
-    const sorts = {
-        price_asc:  { price:     1 },
-        price_desc: { price:    -1 },
-        newest:     { createdAt: -1 },
-        popular:    { soldCount: -1 },
-        rating:     { 'ratings.average': -1 },
-    };
-    return sorts[sortParam] || { createdAt: -1 };
-};
 
 /**
  * Get paginated product list with filters and sorting.
@@ -50,27 +14,56 @@ const getProducts = async (query) => {
         parseInt(query.limit) || PAGINATION.DEFAULT_LIMIT,
         PAGINATION.MAX_LIMIT
     );
-    const skip = (page - 1) * limit;
+    const offset = (page - 1) * limit;
 
-    const filter = buildFilter(query);
-    const sort   = buildSort(query.sort);
+    let sbQuery = supabase
+        .from('products')
+        .select('*, category:categories(name, slug)', { count: 'exact' })
+        .eq('is_active', true);
 
-    const [products, total] = await Promise.all([
-        Product.find(filter)
-            .sort(sort)
-            .skip(skip)
-            .limit(limit)
-            .populate('category', 'name slug'),
-        Product.countDocuments(filter),
-    ]);
+    // Filters
+    if (query.category) sbQuery = sbQuery.eq('category_id', query.category);
+    if (query.brand)    sbQuery = sbQuery.ilike('brand', `%${query.brand}%`);
+    if (query.tag)      sbQuery = sbQuery.contains('tags', [query.tag]);
+    if (query.featured === 'true') sbQuery = sbQuery.eq('is_featured', true);
+
+    // Price range
+    if (query.minPrice) sbQuery = sbQuery.gte('price', Number(query.minPrice));
+    if (query.maxPrice) sbQuery = sbQuery.lte('price', Number(query.maxPrice));
+
+    // Sorting
+    const sortParam = query.sort || 'newest';
+    switch (sortParam) {
+        case 'price_asc':
+            sbQuery = sbQuery.order('price', { ascending: true });
+            break;
+        case 'price_desc':
+            sbQuery = sbQuery.order('price', { ascending: false });
+            break;
+        case 'popular':
+            sbQuery = sbQuery.order('sold_count', { ascending: false });
+            break;
+        case 'rating':
+            sbQuery = sbQuery.order('ratings->average', { ascending: false });
+            break;
+        case 'newest':
+        default:
+            sbQuery = sbQuery.order('created_at', { ascending: false });
+            break;
+    }
+
+    const { data: products, count, error } = await sbQuery
+        .range(offset, offset + limit - 1);
+
+    if (error) throw new AppError('Error fetching products.', 500);
 
     return {
         products,
         pagination: {
-            total,
+            total: count,
             page,
             limit,
-            pages: Math.ceil(total / limit),
+            pages: Math.ceil(count / limit),
         },
     };
 };
@@ -84,25 +77,22 @@ const searchProducts = async (query) => {
 
     const pageNum  = Math.max(1, parseInt(page));
     const limitNum = Math.min(parseInt(limit), PAGINATION.MAX_LIMIT);
-    const skip     = (pageNum - 1) * limitNum;
+    const offset   = (pageNum - 1) * limitNum;
 
-    const filter = {
-        isActive: true,
-        $text: { $search: q },
-    };
+    // Simple search using ILIKE for title/brand/description
+    const { data: products, count, error } = await supabase
+        .from('products')
+        .select('*, category:categories(name, slug)', { count: 'exact' })
+        .eq('is_active', true)
+        .or(`title.ilike.%${q}%,brand.ilike.%${q}%,description.ilike.%${q}%`)
+        .range(offset, offset + limitNum - 1)
+        .order('created_at', { ascending: false });
 
-    const [products, total] = await Promise.all([
-        Product.find(filter, { score: { $meta: 'textScore' } })
-            .sort({ score: { $meta: 'textScore' } })
-            .skip(skip)
-            .limit(limitNum)
-            .populate('category', 'name slug'),
-        Product.countDocuments(filter),
-    ]);
+    if (error) throw new AppError('Error searching products.', 500);
 
     return {
         products,
-        pagination: { total, page: pageNum, limit: limitNum, pages: Math.ceil(total / limitNum) },
+        pagination: { total: count, page: pageNum, limit: limitNum, pages: Math.ceil(count / limitNum) },
     };
 };
 
@@ -110,13 +100,18 @@ const searchProducts = async (query) => {
  * Get a single product by ID or slug.
  */
 const getProductByIdOrSlug = async (identifier) => {
-    const isId   = identifier.match(/^[a-f\d]{24}$/i);
-    const query  = isId ? { _id: identifier } : { slug: identifier };
-    const product = await Product.findOne({ ...query, isActive: true })
-        .populate('category', 'name slug')
-        .populate({ path: 'reviews', select: 'user rating comment verified createdAt', options: { limit: 20 } });
+    // Check if UUID
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(identifier);
+    const column = isUuid ? 'id' : 'slug';
 
-    if (!product) throw new AppError('Product not found.', 404);
+    const { data: product, error } = await supabase
+        .from('products')
+        .select('*, category:categories(name, slug), reviews(id, rating, comment, images, created_at, user:users(name, avatar))')
+        .eq(column, identifier)
+        .eq('is_active', true)
+        .single();
+
+    if (error || !product) throw new AppError('Product not found.', 404);
     return product;
 };
 
@@ -124,7 +119,15 @@ const getProductByIdOrSlug = async (identifier) => {
  * Create a new product.
  */
 const createProduct = async (data) => {
-    const product = await Product.create(data);
+    // Slugify title if not provided (handled by trigger in SQL usually, but let's be explicit if needed)
+    // For now, assume data has what we need or add slug logic here if required.
+    const { data: product, error } = await supabase
+        .from('products')
+        .insert(data)
+        .select()
+        .single();
+
+    if (error) throw new AppError(error.message, 400);
     return product;
 };
 
@@ -132,11 +135,14 @@ const createProduct = async (data) => {
  * Update product by ID.
  */
 const updateProduct = async (id, data) => {
-    const product = await Product.findByIdAndUpdate(id, data, {
-        new:              true,
-        runValidators:    true,
-    });
-    if (!product) throw new AppError('Product not found.', 404);
+    const { data: product, error } = await supabase
+        .from('products')
+        .update(data)
+        .eq('id', id)
+        .select()
+        .single();
+
+    if (error || !product) throw new AppError('Product not found or update failed.', 404);
     return product;
 };
 
@@ -144,8 +150,14 @@ const updateProduct = async (id, data) => {
  * Soft-delete (deactivate) a product.
  */
 const deleteProduct = async (id) => {
-    const product = await Product.findByIdAndUpdate(id, { isActive: false }, { new: true });
-    if (!product) throw new AppError('Product not found.', 404);
+    const { data: product, error } = await supabase
+        .from('products')
+        .update({ is_active: false })
+        .eq('id', id)
+        .select()
+        .single();
+
+    if (error || !product) throw new AppError('Product not found.', 404);
     return product;
 };
 
@@ -153,10 +165,16 @@ const deleteProduct = async (id) => {
  * Get featured products.
  */
 const getFeaturedProducts = async (limit = 8) => {
-    return Product.find({ isFeatured: true, isActive: true })
-        .sort({ soldCount: -1 })
-        .limit(limit)
-        .populate('category', 'name slug');
+    const { data, error } = await supabase
+        .from('products')
+        .select('*, category:categories(name, slug)')
+        .eq('is_featured', true)
+        .eq('is_active', true)
+        .order('sold_count', { ascending: false })
+        .limit(limit);
+
+    if (error) throw new AppError('Error fetching featured products.', 500);
+    return data;
 };
 
 module.exports = {

@@ -3,67 +3,117 @@
 
 const asyncCatch = require('../utils/asyncCatch');
 const AppError   = require('../utils/AppError');
-const User       = require('../models/User');
-const Order      = require('../models/Order');
-const Product    = require('../models/Product');
-const Hero       = require('../models/Hero');
-const Ticker     = require('../models/Ticker');
-const Settings   = require('../models/Settings');
+const supabase   = require('../config/supabase');
 
 // ── Dashboard Stats (Admin Only) ─────────────────────────────────────────────
 const getDashboardStats = asyncCatch(async (req, res) => {
-    const [totalOrders, totalUsers, totalProducts, revenueData] = await Promise.all([
-        Order.countDocuments(),
-        User.countDocuments({ role: 'user' }),
-        Product.countDocuments({ isActive: true }),
-        Order.aggregate([
-            { $match: { paymentStatus: 'paid' } },
-            { $group: { _id: null, total: { $sum: '$totalAmount' } } }
-        ])
+    const [
+        { count: totalOrders },
+        { count: totalUsers },
+        { count: totalProducts },
+        { data: revenueData }
+    ] = await Promise.all([
+        supabase.from('orders').select('*', { count: 'exact', head: true }),
+        supabase.from('users').select('*', { count: 'exact', head: true }).eq('role', 'user'),
+        supabase.from('products').select('*', { count: 'exact', head: true }).eq('is_active', true),
+        supabase.from('orders').select('total_amount').eq('payment_status', 'paid')
     ]);
+
+    const totalRevenue = revenueData?.reduce((sum, order) => sum + Number(order.total_amount), 0) || 0;
 
     res.status(200).json({
         success: true,
         stats: {
-            totalOrders,
-            totalUsers,
-            totalProducts,
-            totalRevenue: revenueData[0]?.total || 0
+            totalOrders: totalOrders || 0,
+            totalUsers: totalUsers || 0,
+            totalProducts: totalProducts || 0,
+            totalRevenue
         }
     });
 });
 
 // ── CMS: Hero Section ────────────────────────────────────────────────────────
 const getHero = asyncCatch(async (req, res) => {
-    const hero = await Hero.findOne().sort({ createdAt: -1 });
+    const { data: hero } = await supabase
+        .from('hero_slides')
+        .select('*')
+        .eq('is_active', true)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .single();
+
     res.status(200).json({ success: true, hero });
 });
 
 const updateHero = asyncCatch(async (req, res) => {
-    const hero = await Hero.findOneAndUpdate({}, req.body, { upsert: true, new: true });
-    res.status(200).json({ success: true, message: 'Hero updated.', hero });
+    // Upsert logic: if there is an existing hero, update it, else insert.
+    // Simplified: update the latest or insert new.
+    const { data: existing } = await supabase.from('hero_slides').select('id').limit(1).single();
+
+    let result;
+    if (existing) {
+        result = await supabase.from('hero_slides').update(req.body).eq('id', existing.id).select().single();
+    } else {
+        result = await supabase.from('hero_slides').insert(req.body).select().single();
+    }
+
+    if (result.error) throw new AppError('Error updating hero.', 500);
+
+    res.status(200).json({ success: true, message: 'Hero updated.', hero: result.data });
 });
 
 // ── CMS: Ticker ──────────────────────────────────────────────────────────────
 const getTicker = asyncCatch(async (req, res) => {
-    const ticker = await Ticker.findOne().sort({ createdAt: -1 });
+    const { data: ticker } = await supabase
+        .from('tickers')
+        .select('*')
+        .eq('is_active', true)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .single();
+
     res.status(200).json({ success: true, ticker });
 });
 
 const updateTicker = asyncCatch(async (req, res) => {
-    const ticker = await Ticker.findOneAndUpdate({}, req.body, { upsert: true, new: true });
-    res.status(200).json({ success: true, message: 'Ticker updated.', ticker });
+    const { data: existing } = await supabase.from('tickers').select('id').limit(1).single();
+
+    let result;
+    if (existing) {
+        result = await supabase.from('tickers').update(req.body).eq('id', existing.id).select().single();
+    } else {
+        result = await supabase.from('tickers').insert(req.body).select().single();
+    }
+
+    if (result.error) throw new AppError('Error updating ticker.', 500);
+
+    res.status(200).json({ success: true, message: 'Ticker updated.', ticker: result.data });
 });
 
 // ── CMS: Settings ────────────────────────────────────────────────────────────
 const getSettings = asyncCatch(async (req, res) => {
-    const settings = await Settings.findOne();
+    const { data: settings } = await supabase
+        .from('site_settings')
+        .select('*')
+        .limit(1)
+        .single();
+
     res.status(200).json({ success: true, settings });
 });
 
 const updateSettings = asyncCatch(async (req, res) => {
-    const settings = await Settings.findOneAndUpdate({}, req.body, { upsert: true, new: true });
-    res.status(200).json({ success: true, message: 'Settings updated.', settings });
+    const { data: existing } = await supabase.from('site_settings').select('id').limit(1).single();
+
+    let result;
+    if (existing) {
+        result = await supabase.from('site_settings').update(req.body).eq('id', existing.id).select().single();
+    } else {
+        result = await supabase.from('site_settings').insert(req.body).select().single();
+    }
+
+    if (result.error) throw new AppError('Error updating settings.', 500);
+
+    res.status(200).json({ success: true, message: 'Settings updated.', settings: result.data });
 });
 
 module.exports = { 

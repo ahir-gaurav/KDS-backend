@@ -1,9 +1,9 @@
 // backend/services/authService.js
 'use strict';
 
-const jwt     = require('jsonwebtoken');
-const bcrypt  = require('bcryptjs');
-const User    = require('../models/User');
+const jwt      = require('jsonwebtoken');
+const bcrypt   = require('bcryptjs');
+const supabase = require('../config/supabase');
 const AppError = require('../utils/AppError');
 const { TOKEN_TTL } = require('../config/constants');
 
@@ -36,7 +36,7 @@ const setRefreshCookie = (res, token) => {
         secure:   process.env.NODE_ENV === 'production',
         sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
         maxAge:   TOKEN_TTL.REFRESH,
-        path:     '/api/auth/refresh-token',   // restrict cookie scope
+        path:     '/api/auth/refresh-token',
     });
 };
 
@@ -53,77 +53,112 @@ const clearAuthCookies = (res) => {
 // ── Core auth service methods ─────────────────────────────────────────────────
 
 /**
- * Register a new user (without verifying email yet).
- * Returns the created user + OTP for email dispatch.
+ * Register a new user.
  */
 const registerUser = async ({ name, email, password }) => {
-    const existing = await User.findOne({ email });
+    const { data: existing, error: findError } = await supabase
+        .from('users')
+        .select('*')
+        .eq('email', email.toLowerCase())
+        .single();
 
-    if (existing?.isVerified) {
+    if (findError && findError.code !== 'PGRST116') { // PGRST116 is "not found"
+        throw new AppError('Error checking existing user.', 500);
+    }
+
+    if (existing?.is_verified) {
         throw new AppError('An account with this email already exists.', 409);
     }
 
     const otp    = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiry = new Date(Date.now() + TOKEN_TTL.OTP);
+    const expiry = new Date(Date.now() + TOKEN_TTL.OTP).toISOString();
+    const hashedPassword = await bcrypt.hash(password, 12);
 
-    if (existing && !existing.isVerified) {
-        // Re-use unverified account — update details and resend OTP
-        existing.name                  = name;
-        existing.password              = password;   // pre-save hook hashes
-        existing.verificationOTP       = otp;
-        existing.verificationOTPExpiry = expiry;
-        await existing.save();
-        return { user: existing, otp, isNew: false };
+    if (existing && !existing.is_verified) {
+        // Re-use unverified account
+        const { data: updated, error: updateError } = await supabase
+            .from('users')
+            .update({
+                name,
+                password: hashedPassword,
+                verification_otp: otp,
+                verification_otp_expiry: expiry,
+            })
+            .eq('id', existing.id)
+            .select()
+            .single();
+
+        if (updateError) throw new AppError('Error updating user.', 500);
+        return { user: updated, otp, isNew: false };
     }
 
-    const user = await User.create({
-        name,
-        email,
-        password,
-        verificationOTP:       otp,
-        verificationOTPExpiry: expiry,
-    });
+    const { data: newUser, error: createError } = await supabase
+        .from('users')
+        .insert({
+            name,
+            email: email.toLowerCase(),
+            password: hashedPassword,
+            verification_otp: otp,
+            verification_otp_expiry: expiry,
+        })
+        .select()
+        .single();
 
-    return { user, otp, isNew: true };
+    if (createError) throw new AppError('Error creating user.', 500);
+
+    return { user: newUser, otp, isNew: true };
 };
 
 /**
- * Verify the registration OTP and mark the account as verified.
- * Returns the verified user.
+ * Verify OTP.
  */
 const verifyRegistrationOTP = async ({ email, otp }) => {
-    const user = await User.findOne({ email })
-        .select('+verificationOTP +verificationOTPExpiry');
+    const { data: user, error: findError } = await supabase
+        .from('users')
+        .select('*')
+        .eq('email', email.toLowerCase())
+        .single();
 
-    if (!user)          throw new AppError('User not found.', 404);
-    if (user.isVerified) throw new AppError('Account already verified.', 400);
-    if (user.verificationOTP !== otp)
+    if (findError || !user) throw new AppError('User not found.', 404);
+    if (user.is_verified)   throw new AppError('Account already verified.', 400);
+    if (user.verification_otp !== otp)
         throw new AppError('Invalid OTP.', 400);
-    if (user.verificationOTPExpiry < new Date())
+    if (new Date(user.verification_otp_expiry) < new Date())
         throw new AppError('OTP has expired. Please request a new one.', 400);
 
-    user.isVerified            = true;
-    user.verificationOTP       = undefined;
-    user.verificationOTPExpiry = undefined;
-    await user.save({ validateBeforeSave: false });
+    const { data: updated, error: updateError } = await supabase
+        .from('users')
+        .update({
+            is_verified: true,
+            verification_otp: null,
+            verification_otp_expiry: null,
+        })
+        .eq('id', user.id)
+        .select()
+        .single();
 
-    return user;
+    if (updateError) throw new AppError('Error verifying account.', 500);
+
+    return updated;
 };
 
 /**
- * Authenticate user with email + password.
- * Returns the authenticated user.
+ * Login user.
  */
 const loginUser = async ({ email, password }) => {
-    const user = await User.findOne({ email }).select('+password');
+    const { data: user, error: findError } = await supabase
+        .from('users')
+        .select('*')
+        .eq('email', email.toLowerCase())
+        .single();
 
-    if (!user || !(await user.comparePassword(password))) {
+    if (findError || !user || !(await bcrypt.compare(password, user.password))) {
         throw new AppError('Invalid email or password.', 401);
     }
-    if (!user.isVerified) {
+    if (!user.is_verified) {
         throw new AppError('Please verify your email before logging in.', 401);
     }
-    if (!user.isActive) {
+    if (!user.is_active) {
         throw new AppError('Your account has been deactivated. Contact support.', 403);
     }
 
@@ -131,7 +166,7 @@ const loginUser = async ({ email, password }) => {
 };
 
 /**
- * Rotate refresh token — verify existing RT, issue new pair.
+ * Refresh tokens.
  */
 const refreshTokens = async (refreshToken) => {
     if (!refreshToken) throw new AppError('Refresh token missing.', 401);
@@ -143,44 +178,79 @@ const refreshTokens = async (refreshToken) => {
         throw new AppError('Invalid or expired refresh token.', 401);
     }
 
-    const user = await User.findById(decoded.id);
-    if (!user || !user.isActive) throw new AppError('User not found or deactivated.', 401);
+    const { data: user, error: findError } = await supabase
+        .from('users')
+        .select('*')
+        .eq('id', decoded.id)
+        .single();
+
+    if (findError || !user || !user.is_active) {
+        throw new AppError('User not found or deactivated.', 401);
+    }
 
     return user;
 };
 
 /**
- * Initiate forgot-password flow — generates reset OTP.
+ * Forgot password.
  */
 const forgotPassword = async (email) => {
-    const user = await User.findOne({ email }).select('+resetOTP +resetOTPExpiry');
-    if (!user) throw new AppError('No account found with this email address.', 404);
+    const { data: user, error: findError } = await supabase
+        .from('users')
+        .select('*')
+        .eq('email', email.toLowerCase())
+        .single();
+
+    if (findError || !user) throw new AppError('No account found with this email address.', 404);
 
     const otp    = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiry = new Date(Date.now() + TOKEN_TTL.OTP);
+    const expiry = new Date(Date.now() + TOKEN_TTL.OTP).toISOString();
 
-    user.resetOTP       = otp;
-    user.resetOTPExpiry = expiry;
-    await user.save({ validateBeforeSave: false });
+    const { data: updated, error: updateError } = await supabase
+        .from('users')
+        .update({
+            reset_otp: otp,
+            reset_otp_expiry: expiry,
+        })
+        .eq('id', user.id)
+        .select()
+        .single();
 
-    return { user, otp };
+    if (updateError) throw new AppError('Error setting reset OTP.', 500);
+
+    return { user: updated, otp };
 };
 
 /**
- * Complete password reset using OTP.
+ * Reset password.
  */
 const resetPassword = async ({ email, otp, newPassword }) => {
-    const user = await User.findOne({ email }).select('+resetOTP +resetOTPExpiry +password');
-    if (!user)                             throw new AppError('User not found.', 404);
-    if (user.resetOTP !== otp)             throw new AppError('Invalid OTP.', 400);
-    if (user.resetOTPExpiry < new Date())  throw new AppError('OTP expired.', 400);
+    const { data: user, error: findError } = await supabase
+        .from('users')
+        .select('*')
+        .eq('email', email.toLowerCase())
+        .single();
 
-    user.password       = newPassword;  // pre-save hook hashes it
-    user.resetOTP       = undefined;
-    user.resetOTPExpiry = undefined;
-    await user.save();
+    if (findError || !user)              throw new AppError('User not found.', 404);
+    if (user.reset_otp !== otp)          throw new AppError('Invalid OTP.', 400);
+    if (new Date(user.reset_otp_expiry) < new Date()) throw new AppError('OTP expired.', 400);
 
-    return user;
+    const hashedPassword = await bcrypt.hash(newPassword, 12);
+
+    const { data: updated, error: updateError } = await supabase
+        .from('users')
+        .update({
+            password: hashedPassword,
+            reset_otp: null,
+            reset_otp_expiry: null,
+        })
+        .eq('id', user.id)
+        .select()
+        .single();
+
+    if (updateError) throw new AppError('Error resetting password.', 500);
+
+    return updated;
 };
 
 module.exports = {

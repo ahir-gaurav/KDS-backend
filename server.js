@@ -9,7 +9,6 @@ const express        = require('express');
 const cors           = require('cors');
 const helmet         = require('helmet');
 const cookieParser   = require('cookie-parser');
-const mongoSanitize  = require('express-mongo-sanitize');
 const sanitizeHtml   = require('sanitize-html');
 
 // Custom XSS sanitiser middleware (replaces deprecated xss-clean)
@@ -27,7 +26,7 @@ const xssSanitize = (req, _res, next) => {
     next();
 };
 
-const connectDB            = require('./config/db');
+const supabase             = require('./config/supabase');
 const { globalLimiter }    = require('./middleware/rateLimiter');
 const requestLogger        = require('./middleware/requestLogger');
 const errorHandler         = require('./middleware/errorHandler');
@@ -51,8 +50,7 @@ const { startCronJobs } = require('./services/cron');
 
 const app = express();
 
-// ── Database ─────────────────────────────────────────────────────────────────
-connectDB();
+// ── Database (Supabase initialized via config/supabase.js) ───────────────────
 
 // ── Trust proxy (Render / Railway / Vercel) ───────────────────────────────────
 app.set('trust proxy', 1);
@@ -98,7 +96,6 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // ── Sanitisation ──────────────────────────────────────────────────────────────
-app.use(mongoSanitize());   // Strip $ and . from req.body/params/query
 app.use(xssSanitize);       // Sanitise user-supplied HTML (strips all tags)
 
 // ── Request logger ────────────────────────────────────────────────────────────

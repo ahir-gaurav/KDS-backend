@@ -3,15 +3,13 @@
 
 const Razorpay  = require('razorpay');
 const crypto    = require('crypto');
-const Order     = require('../models/Order');
-const Payment   = require('../models/Payment');
-const Cart      = require('../models/Cart');
+const supabase  = require('../config/supabase');
 const AppError  = require('../utils/AppError');
 const { deductStock } = require('./orderService');
 const { PAYMENT_STATUS, ORDER_STATUS } = require('../config/constants');
 const { toPaise } = require('../utils/helpers');
 
-// ── Razorpay instance (lazy — only initialised when keys are present) ─────────
+// ── Razorpay instance ─────────────────────────────────────────────────────────
 let razorpayInstance = null;
 const getRazorpay = () => {
     if (!razorpayInstance) {
@@ -27,56 +25,56 @@ const getRazorpay = () => {
 };
 
 // ── Initiate Razorpay payment ─────────────────────────────────────────────────
-/**
- * Creates a Razorpay order and a pending Payment record.
- * Called after createOrder() for non-COD orders.
- */
 const initiatePayment = async ({ orderId, userId }) => {
-    const order = await Order.findById(orderId);
-    if (!order)              throw new AppError('Order not found.', 404);
-    if (order.user.toString() !== userId.toString())
-        throw new AppError('Not authorized.', 403);
-    if (order.paymentStatus === PAYMENT_STATUS.PAID)
+    const { data: order, error } = await supabase
+        .from('orders')
+        .select('*')
+        .eq('id', orderId)
+        .single();
+
+    if (error || !order)    throw new AppError('Order not found.', 404);
+    if (order.user_id !== userId) throw new AppError('Not authorized.', 403);
+    if (order.payment_status === PAYMENT_STATUS.PAID)
         throw new AppError('Order is already paid.', 400);
 
     const rz = getRazorpay();
-    const amountPaise = toPaise(order.totalAmount);
+    const amountPaise = toPaise(order.total_amount);
 
     const rzOrder = await rz.orders.create({
         amount:   amountPaise,
         currency: 'INR',
-        receipt:  order.orderNumber,
+        receipt:  order.order_number,
     });
 
-    // Update backend order with gateway order ID
-    order.razorpayOrderId = rzOrder.id;
-    await order.save();
+    // Update backend order
+    await supabase
+        .from('orders')
+        .update({ razorpay_order_id: rzOrder.id })
+        .eq('id', order.id);
 
-    // Create Payment record in pending state
-    await Payment.create({
-        order:          order._id,
-        user:           userId,
-        method:         'razorpay',
-        gatewayOrderId: rzOrder.id,
-        status:         PAYMENT_STATUS.PENDING,
-        amount:         amountPaise,
-        receiptId:      order.orderNumber,
-    });
+    // Create Payment record
+    await supabase
+        .from('payments')
+        .insert({
+            order_id:         order.id,
+            user_id:          userId,
+            method:           'razorpay',
+            gateway_order_id: rzOrder.id,
+            status:           PAYMENT_STATUS.PENDING,
+            amount:           order.total_amount,
+            receipt_id:       order.order_number,
+        });
 
     return {
         key:       process.env.RAZORPAY_KEY_ID,
         amount:    amountPaise,
         currency:  'INR',
         orderId:   rzOrder.id,
-        orderNumber: order.orderNumber,
+        orderNumber: order.order_number,
     };
 };
 
-// ── Verify payment signature ──────────────────────────────────────────────────
-/**
- * Verifies the HMAC-SHA256 signature Razorpay sends after payment.
- * Marks order as paid and deducts stock.
- */
+// ── Verify payment ────────────────────────────────────────────────────────────
 const verifyPayment = async ({ razorpayOrderId, razorpayPaymentId, razorpaySignature, userId }) => {
     const expectedSignature = crypto
         .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
@@ -87,42 +85,48 @@ const verifyPayment = async ({ razorpayOrderId, razorpayPaymentId, razorpaySigna
         throw new AppError('Payment verification failed — invalid signature.', 400);
     }
 
-    const order = await Order.findOne({ razorpayOrderId });
-    if (!order) throw new AppError('Order not found for this payment.', 404);
-    if (order.user.toString() !== userId.toString())
-        throw new AppError('Not authorized.', 403);
+    const { data: order, error } = await supabase
+        .from('orders')
+        .select('*, order_items(*)')
+        .eq('razorpay_order_id', razorpayOrderId)
+        .single();
+
+    if (error || !order) throw new AppError('Order not found for this payment.', 404);
+    if (order.user_id !== userId) throw new AppError('Not authorized.', 403);
+
+    const newHistory = [...(order.status_history || []), { status: ORDER_STATUS.CONFIRMED, note: 'Payment verified', timestamp: new Date().toISOString() }];
 
     // Update order
-    order.razorpayPaymentId = razorpayPaymentId;
-    order.razorpaySignature = razorpaySignature;
-    order.paymentStatus     = PAYMENT_STATUS.PAID;
-    order.status            = ORDER_STATUS.CONFIRMED;
-    order.statusHistory.push({ status: ORDER_STATUS.CONFIRMED, note: 'Payment verified' });
-    await order.save();
+    await supabase
+        .from('orders')
+        .update({
+            razorpay_payment_id: razorpayPaymentId,
+            razorpay_signature: razorpaySignature,
+            payment_status:     PAYMENT_STATUS.PAID,
+            status:            ORDER_STATUS.CONFIRMED,
+            status_history:     newHistory
+        })
+        .eq('id', order.id);
 
     // Update Payment record
-    await Payment.findOneAndUpdate(
-        { gatewayOrderId: razorpayOrderId },
-        {
-            transactionId:   razorpayPaymentId,
+    await supabase
+        .from('payments')
+        .update({
+            transaction_id:   razorpayPaymentId,
             signature:       razorpaySignature,
             status:          PAYMENT_STATUS.PAID,
-            gatewayResponse: { razorpayOrderId, razorpayPaymentId, razorpaySignature },
-        }
-    );
+            gateway_response: { razorpayOrderId, razorpayPaymentId, razorpaySignature },
+        })
+        .eq('gateway_order_id', razorpayOrderId);
 
     // Deduct stock and clear cart
-    await deductStock(order.items);
-    await Cart.findOneAndUpdate({ user: userId }, { items: [] });
+    await deductStock(order.order_items);
+    await supabase.from('cart_items').delete().eq('user_id', userId);
 
     return order;
 };
 
-// ── Razorpay webhook handler ──────────────────────────────────────────────────
-/**
- * Validates webhook signature and handles payment.captured / payment.failed events.
- * The body must be the raw Buffer (not parsed JSON).
- */
+// ── Webhook handler ───────────────────────────────────────────────────────────
 const handleWebhook = async (rawBody, signature) => {
     const expectedSig = crypto
         .createHmac('sha256', process.env.RAZORPAY_WEBHOOK_SECRET)
@@ -138,31 +142,50 @@ const handleWebhook = async (rawBody, signature) => {
 
     if (!entity) return { received: true };
 
-    const order = await Order.findOne({ razorpayOrderId: entity.order_id });
-    if (!order) return { received: true }; // idempotent
+    const { data: order } = await supabase
+        .from('orders')
+        .select('*')
+        .eq('razorpay_order_id', entity.order_id)
+        .single();
+
+    if (!order) return { received: true };
 
     if (event.event === 'payment.captured') {
-        if (order.paymentStatus !== PAYMENT_STATUS.PAID) {
-            order.paymentStatus     = PAYMENT_STATUS.PAID;
-            order.razorpayPaymentId = entity.id;
-            order.status            = ORDER_STATUS.CONFIRMED;
-            order.statusHistory.push({ status: ORDER_STATUS.CONFIRMED, note: 'Webhook: payment.captured' });
-            await order.save();
-            await Payment.findOneAndUpdate(
-                { gatewayOrderId: entity.order_id },
-                { status: PAYMENT_STATUS.PAID, transactionId: entity.id, gatewayResponse: entity }
-            );
+        if (order.payment_status !== PAYMENT_STATUS.PAID) {
+            const newHistory = [...(order.status_history || []), { status: ORDER_STATUS.CONFIRMED, note: 'Webhook: payment.captured', timestamp: new Date().toISOString() }];
+            
+            await supabase
+                .from('orders')
+                .update({
+                    payment_status:     PAYMENT_STATUS.PAID,
+                    razorpay_payment_id: entity.id,
+                    status:            ORDER_STATUS.CONFIRMED,
+                    status_history:     newHistory
+                })
+                .eq('id', order.id);
+
+            await supabase
+                .from('payments')
+                .update({ status: PAYMENT_STATUS.PAID, transaction_id: entity.id, gateway_response: entity })
+                .eq('gateway_order_id', entity.order_id);
         }
     }
 
     if (event.event === 'payment.failed') {
-        order.paymentStatus = PAYMENT_STATUS.FAILED;
-        order.statusHistory.push({ status: ORDER_STATUS.PROCESSING, note: 'Webhook: payment.failed' });
-        await order.save();
-        await Payment.findOneAndUpdate(
-            { gatewayOrderId: entity.order_id },
-            { status: PAYMENT_STATUS.FAILED, gatewayResponse: entity }
-        );
+        const newHistory = [...(order.status_history || []), { status: order.status, note: 'Webhook: payment.failed', timestamp: new Date().toISOString() }];
+        
+        await supabase
+            .from('orders')
+            .update({
+                payment_status: PAYMENT_STATUS.FAILED,
+                status_history: newHistory
+            })
+            .eq('id', order.id);
+
+        await supabase
+            .from('payments')
+            .update({ status: PAYMENT_STATUS.FAILED, gateway_response: entity })
+            .eq('gateway_order_id', entity.order_id);
     }
 
     return { received: true };
@@ -170,25 +193,35 @@ const handleWebhook = async (rawBody, signature) => {
 
 // ── Initiate refund ───────────────────────────────────────────────────────────
 const initiateRefund = async ({ orderId, amount, userId, isAdmin = false }) => {
-    const filter = isAdmin ? { _id: orderId } : { _id: orderId, user: userId };
-    const order  = await Order.findOne(filter);
+    let sbQuery = supabase.from('orders').select('*').eq('id', orderId);
+    if (!isAdmin) sbQuery = sbQuery.eq('user_id', userId);
 
-    if (!order)                                   throw new AppError('Order not found.', 404);
-    if (order.paymentStatus !== PAYMENT_STATUS.PAID) throw new AppError('Order has not been paid.', 400);
-    if (!order.razorpayPaymentId)                 throw new AppError('No payment ID on file for this order.', 400);
+    const { data: order, error } = await sbQuery.single();
+
+    if (error || !order)                          throw new AppError('Order not found.', 404);
+    if (order.payment_status !== PAYMENT_STATUS.PAID) throw new AppError('Order has not been paid.', 400);
+    if (!order.razorpay_payment_id)               throw new AppError('No payment ID on file for this order.', 400);
 
     const rz         = getRazorpay();
-    const refundAmt  = toPaise(amount || order.totalAmount);
-    const refund     = await rz.payments.refund(order.razorpayPaymentId, { amount: refundAmt });
+    const refundAmt  = toPaise(amount || order.total_amount);
+    const refund     = await rz.payments.refund(order.razorpay_payment_id, { amount: refundAmt });
 
-    order.paymentStatus = PAYMENT_STATUS.REFUNDED;
-    order.refundStatus  = 'initiated';
-    await order.save();
+    await supabase
+        .from('orders')
+        .update({
+            payment_status: PAYMENT_STATUS.REFUNDED,
+            refund_status:  'initiated'
+        })
+        .eq('id', order.id);
 
-    await Payment.findOneAndUpdate(
-        { order: order._id },
-        { refundId: refund.id, refundAmount: refundAmt, refundedAt: new Date() }
-    );
+    await supabase
+        .from('payments')
+        .update({
+            refund_id: refund.id,
+            refund_amount: amount || order.total_amount,
+            refunded_at: new Date().toISOString()
+        })
+        .eq('order_id', order.id);
 
     return refund;
 };

@@ -8,7 +8,8 @@
  */
 
 const REQUIRED_VARS = [
-    'MONGODB_URI',
+    'SUPABASE_URL',
+    'SUPABASE_SERVICE_ROLE_KEY',
     'JWT_SECRET',
     'JWT_REFRESH_SECRET',
 ];

@@ -1,14 +1,13 @@
 // backend/middleware/auth.js
 'use strict';
 
-const jwt     = require('jsonwebtoken');
-const User    = require('../models/User');
+const jwt      = require('jsonwebtoken');
+const supabase = require('../config/supabase');
 const AppError = require('../utils/AppError');
 const asyncCatch = require('../utils/asyncCatch');
 
 /**
  * protect — verify JWT (from httpOnly cookie OR Authorization header).
- * Attaches the full user document to req.user.
  */
 const protect = asyncCatch(async (req, res, next) => {
     let token = req.cookies?.token;
@@ -21,9 +20,14 @@ const protect = asyncCatch(async (req, res, next) => {
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    const user = await User.findById(decoded.id).select('+refreshToken');
-    if (!user)          return next(new AppError('User no longer exists.', 401));
-    if (!user.isActive) return next(new AppError('Your account has been deactivated.', 403));
+    const { data: user, error } = await supabase
+        .from('users')
+        .select('*')
+        .eq('id', decoded.id)
+        .single();
+
+    if (error || !user) return next(new AppError('User no longer exists.', 401));
+    if (!user.is_active) return next(new AppError('Your account has been deactivated.', 403));
 
     req.user = user;
     next();
@@ -31,7 +35,6 @@ const protect = asyncCatch(async (req, res, next) => {
 
 /**
  * optionalAuth — same as protect but doesn't reject if no token present.
- * Useful for public routes that have different behaviour for logged-in users.
  */
 const optionalAuth = asyncCatch(async (req, res, next) => {
     let token = req.cookies?.token;
@@ -42,7 +45,12 @@ const optionalAuth = asyncCatch(async (req, res, next) => {
 
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        req.user = await User.findById(decoded.id);
+        const { data: user } = await supabase
+            .from('users')
+            .select('*')
+            .eq('id', decoded.id)
+            .single();
+        req.user = user;
     } catch {
         // Invalid token — proceed as guest
     }

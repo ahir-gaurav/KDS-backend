@@ -56,7 +56,7 @@ const sendReviewRequest = async (user, order) => {
     const productLinks = order.items
         .map(
             (i) =>
-                `<li style="margin-bottom:8px;"><a href="${process.env.FRONTEND_URL}/products/${i.product}" style="color:#D9A441;">${i.name}</a></li>`
+                `<li style="margin-bottom:8px;"><a href="${process.env.FRONTEND_URL}/products/${i.product_id || i.product}" style="color:#D9A441;">${i.name}</a></li>`
         )
         .join('');
 
@@ -67,7 +67,7 @@ const sendReviewRequest = async (user, order) => {
       <div style="font-family:Inter,Arial,sans-serif;max-width:600px;margin:0 auto;background:#111;color:#F4F1EA;padding:40px;">
         <h1 style="color:#D9A441;font-weight:900;">KICKS DON'T STINK</h1>
         <h2>⭐ We'd love your feedback!</h2>
-        <p>Hi ${user.name}, your order <strong>#${order.orderNumber}</strong> has been delivered.</p>
+        <p>Hi ${user.name}, your order <strong>#${order.order_number || order.orderNumber}</strong> has been delivered.</p>
         <p>Share your thoughts on:</p>
         <ul>${productLinks}</ul>
       </div>

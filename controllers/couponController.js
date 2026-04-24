@@ -1,75 +1,112 @@
-const Coupon = require('../models/Coupon');
-const Order = require('../models/Order');
+// backend/controllers/couponController.js
+'use strict';
+
+const asyncCatch = require('../utils/asyncCatch');
+const AppError   = require('../utils/AppError');
+const supabase   = require('../config/supabase');
 
 // POST /api/coupons/validate
-const validateCoupon = async (req, res) => {
-    try {
-        const { code, subtotal } = req.body;
-        const coupon = await Coupon.findOne({ code: code.toUpperCase(), isActive: true });
+const validateCoupon = asyncCatch(async (req, res) => {
+    const { code, subtotal } = req.body;
+    if (!code) throw new AppError('Coupon code is required.', 400);
 
-        if (!coupon) return res.status(404).json({ message: 'Invalid coupon code' });
-        if (coupon.expiryDate < new Date()) return res.status(400).json({ message: 'Coupon expired' });
-        if (coupon.usageLimit && coupon.usedCount >= coupon.usageLimit) {
-            return res.status(400).json({ message: 'Coupon usage limit reached' });
-        }
-        if (subtotal < coupon.minOrderValue) {
-            return res.status(400).json({ message: `Minimum order value ₹${coupon.minOrderValue} required` });
-        }
-        if (coupon.usedBy.includes(req.user._id)) {
-            return res.status(400).json({ message: 'You have already used this coupon' });
-        }
+    const { data: coupon, error } = await supabase
+        .from('coupons')
+        .select('*')
+        .eq('code', code.toUpperCase())
+        .eq('is_active', true)
+        .single();
 
-        if (coupon.type === 'firstOrder') {
-            const prevOrders = await Order.countDocuments({ user: req.user._id });
-            if (prevOrders > 0) {
-                return res.status(400).json({ message: 'This coupon is only valid on your first order' });
-            }
-        }
-
-        const discountAmount = Math.round((subtotal * coupon.discount) / 100);
-        res.json({ valid: true, discount: coupon.discount, discountAmount, coupon });
-    } catch (error) {
-        res.status(500).json({ message: 'Server error' });
+    if (error || !coupon) throw new AppError('Invalid coupon code.', 404);
+    if (new Date(coupon.expiry_date) < new Date()) throw new AppError('Coupon expired.', 400);
+    if (coupon.usage_limit && coupon.used_count >= coupon.usage_limit) {
+        throw new AppError('Coupon usage limit reached.', 400);
     }
-};
+    if (subtotal < Number(coupon.min_purchase)) {
+        throw new AppError(`Minimum order value ₹${coupon.min_purchase} required.`, 400);
+    }
+
+    // Check if user already used this coupon
+    const { data: usage } = await supabase
+        .from('coupon_usage')
+        .select('id')
+        .eq('coupon_id', coupon.id)
+        .eq('user_id', req.user.id)
+        .limit(1);
+
+    if (usage && usage.length > 0) {
+        throw new AppError('You have already used this coupon.', 400);
+    }
+
+    if (coupon.discount_type === 'firstOrder') {
+        const { count } = await supabase
+            .from('orders')
+            .select('*', { count: 'exact', head: true })
+            .eq('user_id', req.user.id);
+        
+        if (count > 0) {
+            throw new AppError('This coupon is only valid on your first order.', 400);
+        }
+    }
+
+    let discountAmount = 0;
+    if (coupon.discount_type === 'percentage') {
+        discountAmount = Math.round((subtotal * Number(coupon.discount_amount)) / 100);
+        if (coupon.max_discount && discountAmount > Number(coupon.max_discount)) {
+            discountAmount = Number(coupon.max_discount);
+        }
+    } else {
+        discountAmount = Number(coupon.discount_amount);
+    }
+
+    res.json({ valid: true, discount: coupon.discount_amount, discountAmount, coupon });
+});
 
 // Admin CRUD
-const getAllCoupons = async (req, res) => {
-    try {
-        const coupons = await Coupon.find().sort({ createdAt: -1 });
-        res.json({ coupons });
-    } catch (error) {
-        res.status(500).json({ message: 'Server error' });
-    }
-};
+const getAllCoupons = asyncCatch(async (req, res) => {
+    const { data: coupons, error } = await supabase
+        .from('coupons')
+        .select('*')
+        .order('created_at', { ascending: false });
 
-const createCoupon = async (req, res) => {
-    try {
-        const coupon = await Coupon.create(req.body);
-        res.status(201).json({ coupon });
-    } catch (error) {
-        if (error.code === 11000) return res.status(400).json({ message: 'Coupon code already exists' });
-        res.status(500).json({ message: 'Server error', error: error.message });
-    }
-};
+    if (error) throw new AppError('Error fetching coupons.', 500);
+    res.json({ coupons });
+});
 
-const updateCoupon = async (req, res) => {
-    try {
-        const coupon = await Coupon.findByIdAndUpdate(req.params.id, req.body, { new: true });
-        if (!coupon) return res.status(404).json({ message: 'Coupon not found' });
-        res.json({ coupon });
-    } catch (error) {
-        res.status(500).json({ message: 'Server error' });
-    }
-};
+const createCoupon = asyncCatch(async (req, res) => {
+    const { data: coupon, error } = await supabase
+        .from('coupons')
+        .insert({ ...req.body, code: req.body.code.toUpperCase() })
+        .select()
+        .single();
 
-const deleteCoupon = async (req, res) => {
-    try {
-        await Coupon.findByIdAndDelete(req.params.id);
-        res.json({ message: 'Coupon deleted' });
-    } catch (error) {
-        res.status(500).json({ message: 'Server error' });
+    if (error) {
+        if (error.code === '23505') throw new AppError('Coupon code already exists.', 400);
+        throw new AppError(error.message, 500);
     }
-};
+    res.status(201).json({ coupon });
+});
+
+const updateCoupon = asyncCatch(async (req, res) => {
+    const { data: coupon, error } = await supabase
+        .from('coupons')
+        .update(req.body)
+        .eq('id', req.params.id)
+        .select()
+        .single();
+
+    if (error || !coupon) throw new AppError('Coupon not found.', 404);
+    res.json({ coupon });
+});
+
+const deleteCoupon = asyncCatch(async (req, res) => {
+    const { error } = await supabase
+        .from('coupons')
+        .delete()
+        .eq('id', req.params.id);
+
+    if (error) throw new AppError('Error deleting coupon.', 500);
+    res.json({ message: 'Coupon deleted.' });
+});
 
 module.exports = { validateCoupon, getAllCoupons, createCoupon, updateCoupon, deleteCoupon };
